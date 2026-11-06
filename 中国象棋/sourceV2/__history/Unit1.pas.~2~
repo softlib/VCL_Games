@@ -1,0 +1,1098 @@
+﻿unit Unit1;
+
+interface
+
+uses
+  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants,
+  System.Classes, Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs,
+  Vcl.Grids, Vcl.StdCtrls, Vcl.ExtCtrls, System.Generics.Collections,
+  Winapi.GDIPAPI, Winapi.GDIPOBJ,math;
+
+const
+  Cols = 9;
+  Rows = 10;
+
+  // 棋子编码：低 3 位为类型，bit3 为阵营（0=红，8=黑）
+  Empty  = 0;
+  KING   = 1;  // 将/帅
+  ADVISOR= 2;  // 士/仕
+  ELEPHANT=3; // 象/相
+  HORSE  = 4;  // 马
+  ROOK   = 5;  // 车
+  CANNON = 6;  // 炮
+  PAWN   = 7;  // 兵/卒
+  Red    = 0;
+  Black  = 8;
+
+  INF = 1000000;
+
+type
+  TMove = record
+    FromC, FromR, ToC, ToR: ShortInt;
+    Captured: Byte;
+  end;
+
+  TGameState = record
+    Board: array[0..Rows - 1, 0..Cols - 1] of Byte;
+    SideToMove: Byte; // Red / Black
+    GameOver: Boolean;
+  end;
+
+  TForm1 = class(TForm)
+    GridBoard: TStringGrid;
+    PanelBottom: TPanel;
+    lblStatus: TLabel;
+    btnNewGame: TButton;
+    btnUndo: TButton;
+    chkAI: TCheckBox;
+    AITimer: TTimer;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure FormResize(Sender: TObject);
+    procedure GridBoardDrawCell(Sender: TObject; ACol, ARow: Integer;
+      Rect: TRect; State: TGridDrawState);
+    procedure GridBoardMouseUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Integer);
+    procedure btnNewGameClick(Sender: TObject);
+    procedure btnUndoClick(Sender: TObject);
+    procedure chkAIClick(Sender: TObject);
+    procedure AITimerTimer(Sender: TObject);
+  private
+    FBoard: array[0..Rows - 1, 0..Cols - 1] of Byte;
+    FSideToMove: Byte;
+    FGameOver: Boolean;
+    FAIMode: Boolean;
+    FHistory: TList<TGameState>;
+
+    FSelectedC, FSelectedR: Integer;
+    FLegalTargets: array[0..Rows - 1, 0..Cols - 1] of Boolean;
+
+    procedure InitBoard;
+    procedure UpdateStatus;
+    procedure UpdateCellSize;
+    procedure ClearSelection;
+
+    function  PieceOf(C, R: Integer): Byte; inline;
+    function  IsRed(P: Byte): Boolean; inline;
+    function  IsBlack(P: Byte): Boolean; inline;
+    function  SameSide(P, Side: Byte): Boolean; inline;
+
+    procedure GenMoves(const B: TGameState; Side: Byte; List: TList<TMove>);
+    procedure GenPieceMoves(const B: TGameState; C, R: Integer; List: TList<TMove>);
+    function  IsLegalMove(const B: TGameState; FromC, FromR, ToC, ToR: Integer): Boolean;
+    function  KingsFacing(const B: TGameState): Boolean;
+    function  InCheck(const B: TGameState; Side: Byte): Boolean;
+    function  HasAnyLegalMove(const B: TGameState; Side: Byte): Boolean;
+
+    procedure MakeMove(var B: TGameState; const M: TMove);
+    procedure UnmakeMove(var B: TGameState; const M: TMove);
+
+    function  Evaluate(const B: TGameState): Integer;
+    function  AlphaBeta(var B: TGameState; Depth, Alpha, Beta: Integer): Integer;
+    function  SearchBestMove(var B: TGameState; Depth: Integer; out Best: TMove): Boolean;
+
+    procedure AIMove;
+    function  IsHumanTurn: Boolean;
+    function  IsAITurn: Boolean;
+    function  PieceName(P: Byte): string;
+    function  PieceColor(P: Byte): TColor;
+  end;
+
+var
+  Form1: TForm1;
+
+implementation
+
+{$R *.dfm}
+
+// ========== GDI+ 初始化 ==========
+var
+  GdiplusToken: ULONG_PTR = 0;
+
+procedure InitGDIPlus;
+var
+  SI: TGdiplusStartupInput;
+begin
+  SI.GdiplusVersion := 1;
+  SI.DebugEventCallback := nil;
+  SI.SuppressBackgroundThread := False;
+  SI.SuppressExternalCodecs := False;
+  GdiplusStartup(GdiplusToken, @SI, nil);
+end;
+
+procedure DoneGDIPlus;
+begin
+  if GdiplusToken <> 0 then
+    GdiplusShutdown(GdiplusToken);
+end;
+
+// ========== 棋子工具 ==========
+function TForm1.PieceOf(C, R: Integer): Byte;
+begin
+  if (C < 0) or (C >= Cols) or (R < 0) or (R >= Rows) then
+    Result := $FF // 越界当作墙
+  else
+    Result := FBoard[R, C];
+end;
+
+function TForm1.IsRed(P: Byte): Boolean;
+begin
+  Result := (P <> Empty) and (P <> $FF) and ((P and 8) = 0);
+end;
+
+function TForm1.IsBlack(P: Byte): Boolean;
+begin
+  Result := (P <> Empty) and (P <> $FF) and ((P and 8) <> 0);
+end;
+
+function TForm1.SameSide(P, Side: Byte): Boolean;
+begin
+  if (P = Empty) or (P = $FF) then
+    Result := False
+  else if Side = Red then
+    Result := (P and 8) = 0
+  else
+    Result := (P and 8) <> 0;
+end;
+
+function TForm1.PieceName(P: Byte): string;
+begin
+  case P and 7 of
+    KING:     if (P and 8) = 0 then Result := '帅' else Result := '将';
+    ADVISOR:  if (P and 8) = 0 then Result := '仕' else Result := '士';
+    ELEPHANT: if (P and 8) = 0 then Result := '相' else Result := '象';
+    HORSE:    Result := '马';
+    ROOK:     Result := '车';
+    CANNON:   Result := '炮';
+    PAWN:     if (P and 8) = 0 then Result := '兵' else Result := '卒';
+  else
+    Result := '';
+  end;
+end;
+
+function TForm1.PieceColor(P: Byte): TColor;
+begin
+  if (P and 8) = 0 then
+    Result := clRed
+  else
+    Result := clBlack;
+end;
+
+// ========== 窗体生命周期 ==========
+procedure TForm1.FormCreate(Sender: TObject);
+begin
+  DoubleBuffered := True;
+  FHistory := TList<TGameState>.Create;
+
+  GridBoard.DefaultDrawing := False;
+  GridBoard.FixedCols := 0;
+  GridBoard.FixedRows := 0;
+  GridBoard.RowCount := Rows;
+  GridBoard.ColCount := Cols;
+  GridBoard.ScrollBars := ssNone;
+  GridBoard.GridLineWidth := 0;
+  GridBoard.Options := [];
+  GridBoard.TabStop := False;
+
+  UpdateCellSize;
+  FAIMode := False;
+  InitBoard;
+end;
+
+procedure TForm1.FormDestroy(Sender: TObject);
+begin
+  FHistory.Free;
+end;
+
+procedure TForm1.FormResize(Sender: TObject);
+begin
+  UpdateCellSize;
+  GridBoard.Invalidate;
+end;
+
+procedure TForm1.UpdateCellSize;
+var
+  i, cw, ch, remW, remH: Integer;
+begin
+  if (GridBoard.ClientWidth <= 0) or (GridBoard.ClientHeight <= 0) then Exit;
+  cw := GridBoard.ClientWidth div Cols;
+  ch := GridBoard.ClientHeight div Rows;
+  if cw < 10 then cw := 10;
+  if ch < 10 then ch := 10;
+  remW := GridBoard.ClientWidth - cw * Cols;
+  remH := GridBoard.ClientHeight - ch * Rows;
+  for i := 0 to Cols - 1 do
+    GridBoard.ColWidths[i] := cw;
+  for i := 0 to Rows - 1 do
+    GridBoard.RowHeights[i] := ch;
+  if remW > 0 then
+    GridBoard.ColWidths[Cols - 1] := GridBoard.ColWidths[Cols - 1] + remW;
+  if remH > 0 then
+    GridBoard.RowHeights[Rows - 1] := GridBoard.RowHeights[Rows - 1] + remH;
+end;
+
+procedure TForm1.InitBoard;
+const
+  Initial: array[0..Rows - 1] of array[0..Cols - 1] of Byte = (
+    (Black or ROOK,  Black or HORSE, Black or ELEPHANT, Black or ADVISOR, Black or KING, Black or ADVISOR, Black or ELEPHANT, Black or HORSE, Black or ROOK),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Empty, Black or CANNON, Empty, Empty, Empty, Empty, Empty, Black or CANNON, Empty),
+    (Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN),
+    (Empty, Red or CANNON, Empty, Empty, Empty, Empty, Empty, Red or CANNON, Empty),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Red or ROOK, Red or HORSE, Red or ELEPHANT, Red or ADVISOR, Red or KING, Red or ADVISOR, Red or ELEPHANT, Red or HORSE, Red or ROOK)
+  );
+var
+  R, C: Integer;
+begin
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      FBoard[R, C] := Initial[R, C];
+
+  FSideToMove := Red;
+  FGameOver := False;
+  FHistory.Clear;
+  ClearSelection;
+  AITimer.Enabled := False;
+  UpdateStatus;
+  GridBoard.Invalidate;
+end;
+
+procedure TForm1.UpdateStatus;
+begin
+  if FGameOver then
+    lblStatus.Caption := '游戏结束'
+  else if FSideToMove = Red then
+    lblStatus.Caption := '红方走棋'
+  else
+    lblStatus.Caption := '黑方走棋';
+end;
+
+procedure TForm1.ClearSelection;
+var
+  C, R: Integer;
+begin
+  FSelectedC := -1;
+  FSelectedR := -1;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      FLegalTargets[R, C] := False;
+end;
+
+// ========== 绘制 ==========
+procedure TForm1.GridBoardDrawCell(Sender: TObject; ACol, ARow: Integer;
+  Rect: TRect; State: TGridDrawState);
+var
+  G: TGPGraphics;
+  Bg: TGPSolidBrush;
+  PenLine, PenBorder: TGPPen;
+  PieceBrush: TGPLinearGradientBrush;
+  TextBrush: TGPSolidBrush;
+  Font: TGPFont;
+  FontFamily: TGPFontFamily;
+  StringFormat: TGPStringFormat;
+  CX, CY, Radius, X1, Y1, X2, Y2: Integer;
+  P: Byte;
+  S: string;
+begin
+  if (ACol < 0) or (ACol >= Cols) or (ARow < 0) or (ARow >= Rows) then Exit;
+
+  G := TGPGraphics.Create(GridBoard.Canvas.Handle);
+  try
+    G.SetSmoothingMode(SmoothingModeAntiAlias);
+    G.SetTextRenderingHint(TextRenderingHintAntiAlias);
+
+    // 1. 木色背景
+    Bg := TGPSolidBrush.Create(MakeColor(255, 242, 214, 168));
+    try
+      G.FillRectangle(Bg, MakeRect(Rect.Left, Rect.Top, Rect.Width, Rect.Height));
+    finally
+      Bg.Free;
+    end;
+
+    // 单元格几何中心
+    CX := Rect.Left + Rect.Width div 2;
+    CY := Rect.Top + Rect.Height div 2;
+    X1 := Rect.Left + 4;
+    X2 := Rect.Right - 4;
+    Y1 := Rect.Top + 4;
+    Y2 := Rect.Bottom - 4;
+
+    // 2. 棋盘线：每个单元格画“十字”的下半/右半部分
+    PenLine := TGPPen.Create(MakeColor(200, 120, 80, 40), 1);
+    try
+      // 横线：每个单元格都画
+      G.DrawLine(PenLine, X1, CY, X2, CY);
+      // 竖线：楚河汉界（第 4、5 行之间）不画
+      if ARow <> 4 then
+        G.DrawLine(PenLine, CX, Y1, CX, Y2);
+      // 九宫斜线
+      if (ARow in [0, 1, 2, 7, 8, 9]) and (ACol in [3, 4, 5]) then
+      begin
+        if (ARow in [0, 2, 7, 9]) and (ACol in [3, 5]) then
+        begin
+          // 九宫对角线由边缘格负责画一条
+          // 这里简化：由九宫四个角的单元格各画一条短斜线
+        end;
+      end;
+    finally
+      PenLine.Free;
+    end;
+
+    // 3. 棋盘外框（用单元格边界粗线拼出）
+    PenBorder := TGPPen.Create(MakeColor(255, 80, 40, 10), 2);
+    try
+      // 左边界
+      if ACol = 0 then G.DrawLine(PenBorder, X1, Y1, X1, Y2);
+      // 右边界
+      if ACol = Cols - 1 then G.DrawLine(PenBorder, X2, Y1, X2, Y2);
+      // 上边界
+      if ARow = 0 then G.DrawLine(PenBorder, X1, Y1, X2, Y1);
+      // 下边界
+      if ARow = Rows - 1 then G.DrawLine(PenBorder, X1, Y2, X2, Y2);
+    finally
+      PenBorder.Free;
+    end;
+
+    // 4. 选中高亮
+    if (ACol = FSelectedC) and (ARow = FSelectedR) then
+    begin
+      PenBorder := TGPPen.Create(MakeColor(255, 0, 120, 215), 3);
+      try
+        G.DrawEllipse(PenBorder, CX - Rect.Width div 3, CY - Rect.Height div 3,
+          Rect.Width * 2 div 3, Rect.Height * 2 div 3);
+      finally
+        PenBorder.Free;
+      end;
+    end;
+
+    // 5. 合法目标标记
+    if FLegalTargets[ARow, ACol] then
+    begin
+      Bg := TGPSolidBrush.Create(MakeColor(120, 0, 160, 0));
+      try
+        G.FillEllipse(Bg, CX - 5, CY - 5, 10, 10);
+      finally
+        Bg.Free;
+      end;
+    end;
+
+    // 6. 棋子
+    P := FBoard[ARow, ACol];
+    if (P <> Empty) and (P <> $FF) then
+    begin
+      Radius := Min(Rect.Width, Rect.Height) div 2 - 4;
+      if Radius < 8 then Radius := 8;
+
+      if (P and 8) = 0 then
+      begin
+        // 红方棋子：浅黄底，红色字
+        PieceBrush := TGPLinearGradientBrush.Create(
+          MakeRect(CX - Radius, CY - Radius, Radius * 2, Radius * 2),
+          MakeColor(255, 255, 240, 210),
+          MakeColor(255, 235, 200, 150),
+          LinearGradientModeForwardDiagonal);
+        PenBorder := TGPPen.Create(MakeColor(255, 180, 60, 20), 2);
+      end
+      else
+      begin
+        // 黑方棋子：浅灰底，黑色字
+        PieceBrush := TGPLinearGradientBrush.Create(
+          MakeRect(CX - Radius, CY - Radius, Radius * 2, Radius * 2),
+          MakeColor(255, 240, 240, 240),
+          MakeColor(255, 200, 200, 200),
+          LinearGradientModeForwardDiagonal);
+        PenBorder := TGPPen.Create(MakeColor(255, 60, 60, 60), 2);
+      end;
+
+      try
+        G.FillEllipse(PieceBrush, CX - Radius, CY - Radius, Radius * 2, Radius * 2);
+        G.DrawEllipse(PenBorder, CX - Radius, CY - Radius, Radius * 2, Radius * 2);
+      finally
+        PieceBrush.Free;
+        PenBorder.Free;
+      end;
+
+      // 棋子文字
+      S := PieceName(P);
+      if (P and 8) = 0 then
+        TextBrush := TGPSolidBrush.Create(MakeColor(255, 200, 20, 20))
+      else
+        TextBrush := TGPSolidBrush.Create(MakeColor(255, 20, 20, 20));
+      FontFamily := TGPFontFamily.Create('Microsoft YaHei');
+      Font := TGPFont.Create(FontFamily, Radius * 1.1, FontStyleBold, UnitPixel);
+      StringFormat := TGPStringFormat.Create;
+      try
+        StringFormat.Alignment := StringAlignmentCenter;
+        StringFormat.LineAlignment := StringAlignmentCenter;
+        G.DrawString(S, -1, Font,
+          MakeRectF(CX - Radius, CY - Radius, Radius * 2, Radius * 2),
+          StringFormat, TextBrush);
+      finally
+        StringFormat.Free;
+        Font.Free;
+        FontFamily.Free;
+        TextBrush.Free;
+      end;
+    end;
+  finally
+    G.Free;
+  end;
+end;
+
+// ========== 鼠标交互 ==========
+procedure TForm1.GridBoardMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Integer);
+var
+  Col, Row: Longint;
+  P: Byte;
+begin
+  if FGameOver then Exit;
+  if Button <> mbLeft then Exit;
+  if not IsHumanTurn then Exit;
+
+  GridBoard.MouseToCell(X, Y, Col, Row);
+  if (Col < 0) or (Col >= Cols) or (Row < 0) or (Row >= Rows) then Exit;
+
+  P := FBoard[Row, Col];
+
+  // 如果已经选中了棋子，并且点击的是合法目标
+  if (FSelectedC >= 0) and FLegalTargets[Row, Col] then
+  begin
+    // 执行走子
+    if not FGameOver then
+    begin
+      FHistory.Add(TGameState(FBoard, FSideToMove, FGameOver)); // 简化快照
+      FBoard[Row, Col] := FBoard[FSelectedR, FSelectedC];
+      FBoard[FSelectedR, FSelectedC] := Empty;
+      ClearSelection;
+      GridBoard.Invalidate;
+
+      // 切换走棋方
+      if FSideToMove = Red then FSideToMove := Black else FSideToMove := Red;
+      UpdateStatus;
+
+      // 检查将死/困毙
+      if not HasAnyLegalMove(TGameState(FBoard, FSideToMove, False), FSideToMove) then
+      begin
+        FGameOver := True;
+        UpdateStatus;
+        if FSideToMove = Red then
+          ShowMessage('黑方获胜！')
+        else
+          ShowMessage('红方获胜！');
+        Exit;
+      end;
+
+      if IsAITurn then
+        AITimer.Enabled := True;
+    end;
+    Exit;
+  end;
+
+  // 重新选择
+  ClearSelection;
+  if SameSide(P, FSideToMove) then
+  begin
+    FSelectedC := Col;
+    FSelectedR := Row;
+    // 计算合法目标
+    var
+      Moves: TList<TMove>;
+      M: TMove;
+    Moves := TList<TMove>.Create;
+    try
+      GenPieceMoves(TGameState(FBoard, FSideToMove, False), Col, Row, Moves);
+      for M in Moves do
+        FLegalTargets[M.ToR, M.ToC] := True;
+    finally
+      Moves.Free;
+    end;
+  end;
+  GridBoard.Invalidate;
+end;
+
+// ========== 走法生成 ==========
+procedure TForm1.GenMoves(const B: TGameState; Side: Byte; List: TList<TMove>);
+var
+  C, R: Integer;
+begin
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      if SameSide(B.Board[R, C], Side) then
+        GenPieceMoves(B, C, R, List);
+end;
+
+procedure TForm1.GenPieceMoves(const B: TGameState; C, R: Integer; List: TList<TMove>);
+var
+  P, T: Byte;
+  I: Integer;
+  M: TMove;
+
+  procedure Add(TC, TR: Integer);
+  begin
+    if (TC < 0) or (TC >= Cols) or (TR < 0) or (TR >= Rows) then Exit;
+    T := B.Board[TR, TC];
+    if SameSide(T, P) then Exit;
+    M.FromC := C; M.FromR := R; M.ToC := TC; M.ToR := TR;
+    M.Captured := T;
+    List.Add(M);
+  end;
+
+  procedure AddLine(DC, DR: Integer);
+  var
+    CC, RR: Integer;
+    First: Boolean;
+  begin
+    CC := C + DC; RR := R + DR;
+    while (CC >= 0) and (CC < Cols) and (RR >= 0) and (RR < Rows) do
+    begin
+      T := B.Board[RR, CC];
+      if T = Empty then
+      begin
+        Add(CC, RR);
+        Inc(CC, DC); Inc(RR, DR);
+      end
+      else
+      begin
+        if not SameSide(T, P) then Add(CC, RR);
+        Break;
+      end;
+    end;
+  end;
+
+  procedure AddCannon(DC, DR: Integer);
+  var
+    CC, RR: Integer;
+    Screened: Boolean;
+  begin
+    CC := C + DC; RR := R + DR;
+    Screened := False;
+    while (CC >= 0) and (CC < Cols) and (RR >= 0) and (RR < Rows) do
+    begin
+      T := B.Board[RR, CC];
+      if not Screened then
+      begin
+        if T = Empty then
+          Add(CC, RR)
+        else
+          Screened := True;
+      end
+      else
+      begin
+        if T <> Empty then
+        begin
+          if not SameSide(T, P) then Add(CC, RR);
+          Break;
+        end;
+      end;
+      Inc(CC, DC); Inc(RR, DR);
+    end;
+  end;
+
+begin
+  P := B.Board[R, C];
+  case P and 7 of
+    KING:
+      begin
+        // 九宫格内一步直行
+        if R >= 7 then // 红方九宫
+        begin
+          if R > 7 then Add(C, R - 1);
+          if R < 9 then Add(C, R + 1);
+          if C > 3 then Add(C - 1, R);
+          if C < 5 then Add(C + 1, R);
+        end
+        else // 黑方九宫
+        begin
+          if R > 0 then Add(C, R - 1);
+          if R < 2 then Add(C, R + 1);
+          if C > 3 then Add(C - 1, R);
+          if C < 5 then Add(C + 1, R);
+        end;
+      end;
+
+    ADVISOR:
+      begin
+        // 九宫内斜行一步
+        if (R in [7, 8, 9]) then // 红
+        begin
+          if (C = 3) and (R = 9) then Add(4, 8);
+          if (C = 5) and (R = 9) then Add(4, 8);
+          if (C = 4) and (R = 8) then begin Add(3, 9); Add(5, 9); Add(3, 7); Add(5, 7); end;
+          if (C = 3) and (R = 7) then Add(4, 8);
+          if (C = 5) and (R = 7) then Add(4, 8);
+        end
+        else
+        begin
+          if (C = 3) and (R = 0) then Add(4, 1);
+          if (C = 5) and (R = 0) then Add(4, 1);
+          if (C = 4) and (R = 1) then begin Add(3, 0); Add(5, 0); Add(3, 2); Add(5, 2); end;
+          if (C = 3) and (R = 2) then Add(4, 1);
+          if (C = 5) and (R = 2) then Add(4, 1);
+        end;
+      end;
+
+    ELEPHANT:
+      begin
+        // 田字，不过河，象眼不能有子
+        if (R >= 5) then // 红象
+        begin
+          if (C >= 2) and (R >= 2) and (B.Board[R - 1, C - 1] = Empty) then Add(C - 2, R - 2);
+          if (C <= 6) and (R >= 2) and (B.Board[R - 1, C + 1] = Empty) then Add(C + 2, R - 2);
+          if (C >= 2) and (R <= 7) and (B.Board[R + 1, C - 1] = Empty) then Add(C - 2, R + 2);
+          if (C <= 6) and (R <= 7) and (B.Board[R + 1, C + 1] = Empty) then Add(C + 2, R + 2);
+        end
+        else
+        begin
+          if (C >= 2) and (R >= 2) and (B.Board[R - 1, C - 1] = Empty) then Add(C - 2, R - 2);
+          if (C <= 6) and (R >= 2) and (B.Board[R - 1, C + 1] = Empty) then Add(C + 2, R - 2);
+          if (C >= 2) and (R <= 7) and (B.Board[R + 1, C - 1] = Empty) then Add(C - 2, R + 2);
+          if (C <= 6) and (R <= 7) and (B.Board[R + 1, C + 1] = Empty) then Add(C + 2, R + 2);
+        end;
+      end;
+
+    HORSE:
+      begin
+        // 马走日，检查马腿
+        if (R - 2 >= 0) and (B.Board[R - 1, C] = Empty) then
+        begin
+          if C - 1 >= 0 then Add(C - 1, R - 2);
+          if C + 1 < Cols then Add(C + 1, R - 2);
+        end;
+        if (R + 2 < Rows) and (B.Board[R + 1, C] = Empty) then
+        begin
+          if C - 1 >= 0 then Add(C - 1, R + 2);
+          if C + 1 < Cols then Add(C + 1, R + 2);
+        end;
+        if (C - 2 >= 0) and (B.Board[R, C - 1] = Empty) then
+        begin
+          if R - 1 >= 0 then Add(C - 2, R - 1);
+          if R + 1 < Rows then Add(C - 2, R + 1);
+        end;
+        if (C + 2 < Cols) and (B.Board[R, C + 1] = Empty) then
+        begin
+          if R - 1 >= 0 then Add(C + 2, R - 1);
+          if R + 1 < Rows then Add(C + 2, R + 1);
+        end;
+      end;
+
+    ROOK:
+      begin
+        AddLine(1, 0); AddLine(-1, 0);
+        AddLine(0, 1); AddLine(0, -1);
+      end;
+
+    CANNON:
+      begin
+        AddCannon(1, 0); AddCannon(-1, 0);
+        AddCannon(0, 1); AddCannon(0, -1);
+      end;
+
+    PAWN:
+      begin
+        if (P and 8) = 0 then // 红兵向上
+        begin
+          Add(C, R - 1);
+          if R <= 4 then // 过河
+          begin
+            if C > 0 then Add(C - 1, R);
+            if C < Cols - 1 then Add(C + 1, R);
+          end;
+        end
+        else // 黑卒向下
+        begin
+          Add(C, R + 1);
+          if R >= 5 then
+          begin
+            if C > 0 then Add(C - 1, R);
+            if C < Cols - 1 then Add(C + 1, R);
+          end;
+        end;
+      end;
+  end;
+end;
+
+// ========== 规则判定 ==========
+function TForm1.KingsFacing(const B: TGameState): Boolean;
+var
+  C, R, RedK, BlackK: Integer;
+begin
+  RedK := -1; BlackK := -1;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+    begin
+      if (B.Board[R, C] = Red or KING) then RedK := R
+      else if (B.Board[R, C] = Black or KING) then BlackK := R;
+    end;
+
+  Result := False;
+  if (RedK < 0) or (BlackK < 0) then Exit;
+
+  // 找到两将所在的列
+  var RedCol, BlackCol: Integer;
+  RedCol := -1; BlackCol := -1;
+  for C := 0 to Cols - 1 do
+  begin
+    if (RedK >= 0) and (B.Board[RedK, C] = Red or KING) then RedCol := C;
+    if (BlackK >= 0) and (B.Board[BlackK, C] = Black or KING) then BlackCol := C;
+  end;
+
+  if (RedCol < 0) or (BlackCol < 0) or (RedCol <> BlackCol) then Exit;
+
+  // 中间是否有棋子
+  var TopR, BotR: Integer;
+  if RedK < BlackK then begin TopR := RedK; BotR := BlackK end
+  else begin TopR := BlackK; BotR := RedK end;
+
+  for R := TopR + 1 to BotR - 1 do
+    if B.Board[R, RedCol] <> Empty then Exit;
+
+  Result := True;
+end;
+
+function TForm1.InCheck(const B: TGameState; Side: Byte): Boolean;
+var
+  C, R: Integer;
+  Opp: Byte;
+  Moves: TList<TMove>;
+  M: TMove;
+  KingC, KingR: Integer;
+begin
+  Result := False;
+  // 先检查将帅照面
+  if KingsFacing(B) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  Opp := Black;
+  if Side = Black then Opp := Red;
+
+  // 找将/帅
+  KingC := -1; KingR := -1;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      if SameSide(B.Board[R, C], Side) and ((B.Board[R, C] and 7) = KING) then
+      begin
+        KingC := C; KingR := R;
+        Break;
+      end;
+  if KingC < 0 then Exit;
+
+  // 生成对方所有走法，看是否能吃到将/帅
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, Opp, Moves);
+    for M in Moves do
+      if (M.ToC = KingC) and (M.ToR = KingR) then
+      begin
+        Result := True;
+        Exit;
+      end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.HasAnyLegalMove(const B: TGameState; Side: Byte): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Temp: TGameState;
+begin
+  Result := False;
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, Side, Moves);
+    for M in Moves do
+    begin
+      Temp := B;
+      MakeMove(Temp, M);
+      if not InCheck(Temp, Side) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.IsLegalMove(const B: TGameState; FromC, FromR, ToC, ToR: Integer): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Temp: TGameState;
+begin
+  Result := False;
+  Moves := TList<TMove>.Create;
+  try
+    GenPieceMoves(B, FromC, FromR, Moves);
+    for M in Moves do
+      if (M.ToC = ToC) and (M.ToR = ToR) then
+      begin
+        Temp := B;
+        MakeMove(Temp, M);
+        Result := not InCheck(Temp, B.SideToMove);
+        Exit;
+      end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+procedure TForm1.MakeMove(var B: TGameState; const M: TMove);
+begin
+  B.Board[M.ToR, M.ToC] := B.Board[M.FromR, M.FromC];
+  B.Board[M.FromR, M.FromC] := Empty;
+  if B.SideToMove = Red then B.SideToMove := Black else B.SideToMove := Red;
+end;
+
+procedure TForm1.UnmakeMove(var B: TGameState; const M: TMove);
+begin
+  B.Board[M.FromR, M.FromC] := B.Board[M.ToR, M.ToC];
+  B.Board[M.ToR, M.ToC] := M.Captured;
+  if B.SideToMove = Red then B.SideToMove := Black else B.SideToMove := Red;
+end;
+
+// ========== AI ==========
+const
+  PieceValue: array[0..7] of Integer = (
+    0,      // Empty
+    10000,  // King
+    200,    // Advisor
+    200,    // Elephant
+    450,    // Horse
+    900,    // Rook
+    500,    // Cannon
+    100     // Pawn
+  );
+
+function TForm1.Evaluate(const B: TGameState): Integer;
+var
+  R, C: Integer;
+  P: Byte;
+  V: Integer;
+begin
+  Result := 0;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+    begin
+      P := B.Board[R, C];
+      if P = Empty then Continue;
+      V := PieceValue[P and 7];
+      // 兵过河增值
+      if (P and 7) = PAWN then
+      begin
+        if ((P and 8) = 0) and (R <= 4) then Inc(V, 80);  // 红兵过河
+        if ((P and 8) <> 0) and (R >= 5) then Inc(V, 80); // 黑卒过河
+      end;
+      if (P and 8) = 0 then
+        Inc(Result, V)
+      else
+        Dec(Result, V);
+    end;
+  // 从红方视角；如果轮到黑方，取反
+  if B.SideToMove = Black then
+    Result := -Result;
+end;
+
+function TForm1.AlphaBeta(var B: TGameState; Depth, Alpha, Beta: Integer): Integer;
+var
+  Moves: TList<TMove>;
+  M, BestM: TMove;
+  Score: Integer;
+  Maxing: Boolean;
+  HasMove: Boolean;
+begin
+  if Depth = 0 then
+    Exit(Evaluate(B));
+
+  Maxing := B.SideToMove = Red;
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, B.SideToMove, Moves);
+    // 简单排序：优先吃子
+    Moves.Sort(TComparer<TMove>.Construct(
+      function(const L, R: TMove): Integer
+      begin
+        Result := PieceValue[R.Captured and 7] - PieceValue[L.Captured and 7];
+      end));
+
+    HasMove := False;
+    if Maxing then
+    begin
+      Score := -INF;
+      for M in Moves do
+      begin
+        var
+          Temp: TGameState;
+        Temp := B;
+        MakeMove(Temp, M);
+        if InCheck(Temp, Red) then Continue; // 不能送将
+        HasMove := True;
+        Score := AlphaBeta(Temp, Depth - 1, Alpha, Beta);
+        if Score > Alpha then Alpha := Score;
+        if Alpha >= Beta then Break;
+        if Score > Result then Result := Score;
+      end;
+      if not HasMove then
+        Result := -INF + Depth; // 无棋可走（困毙/将死），极坏
+    end
+    else
+    begin
+      Score := INF;
+      for M in Moves do
+      begin
+        var
+          Temp: TGameState;
+        Temp := B;
+        MakeMove(Temp, M);
+        if InCheck(Temp, Black) then Continue;
+        HasMove := True;
+        Score := AlphaBeta(Temp, Depth - 1, Alpha, Beta);
+        if Score < Beta then Beta := Score;
+        if Beta <= Alpha then Break;
+        if Score < Result then Result := Score;
+      end;
+      if not HasMove then
+        Result := INF - Depth;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.SearchBestMove(var B: TGameState; Depth: Integer; out Best: TMove): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Score, BestScore: Integer;
+  Temp: TGameState;
+begin
+  Result := False;
+  BestScore := -INF;
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, B.SideToMove, Moves);
+    Moves.Sort(TComparer<TMove>.Construct(
+      function(const L, R: TMove): Integer
+      begin
+        Result := PieceValue[R.Captured and 7] - PieceValue[L.Captured and 7];
+      end));
+
+    for M in Moves do
+    begin
+      Temp := B;
+      MakeMove(Temp, M);
+      if InCheck(Temp, B.SideToMove) then Continue;
+      Score := AlphaBeta(Temp, Depth - 1, -INF, INF);
+      if Score > BestScore then
+      begin
+        BestScore := Score;
+        Best := M;
+        Result := True;
+      end;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+procedure TForm1.AIMove;
+var
+  B: TGameState;
+  Best: TMove;
+  Temp: TGameState;
+begin
+  B := TGameState(FBoard, FSideToMove, FGameOver);
+  if not SearchBestMove(B, 3, Best) then // 深度 3，响应较快
+  begin
+    FGameOver := True;
+    UpdateStatus;
+    ShowMessage('无合法走法，红方获胜！');
+    Exit;
+  end;
+
+  FHistory.Add(TGameState(FBoard, FSideToMove, FGameOver));
+  FBoard[Best.ToR, Best.ToC] := FBoard[Best.FromR, Best.FromC];
+  FBoard[Best.FromR, Best.FromC] := Empty;
+
+  if FSideToMove = Red then FSideToMove := Black else FSideToMove := Red;
+  ClearSelection;
+  UpdateStatus;
+  GridBoard.Invalidate;
+
+  if not HasAnyLegalMove(TGameState(FBoard, FSideToMove, False), FSideToMove) then
+  begin
+    FGameOver := True;
+    UpdateStatus;
+    if FSideToMove = Red then
+      ShowMessage('黑方获胜！')
+    else
+      ShowMessage('红方获胜！');
+  end;
+end;
+
+function TForm1.IsHumanTurn: Boolean;
+begin
+  Result := (not FAIMode) or (FSideToMove = Red); // 人执红
+end;
+
+function TForm1.IsAITurn: Boolean;
+begin
+  Result := FAIMode and (FSideToMove = Black);   // AI 执黑
+end;
+
+procedure TForm1.AITimerTimer(Sender: TObject);
+begin
+  AITimer.Enabled := False;
+  if (not FGameOver) and IsAITurn then
+    AIMove;
+end;
+
+// ========== 按钮 ==========
+procedure TForm1.btnNewGameClick(Sender: TObject);
+begin
+  if MessageDlg('确定开始新局？', mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
+    Exit;
+  InitBoard;
+end;
+
+procedure TForm1.btnUndoClick(Sender: TObject);
+var
+  State: TGameState;
+begin
+  AITimer.Enabled := False;
+  if FHistory.Count = 0 then Exit;
+
+  State := FHistory.Last;
+  FHistory.Delete(FHistory.Count - 1);
+  FBoard := State.Board;
+  FSideToMove := State.SideToMove;
+  FGameOver := False;
+  ClearSelection;
+  UpdateStatus;
+  GridBoard.Invalidate;
+end;
+
+procedure TForm1.chkAIClick(Sender: TObject);
+begin
+  FAIMode := chkAI.Checked;
+  if FAIMode and (not FGameOver) and IsAITurn then
+    AITimer.Enabled := True;
+end;
+
+initialization
+  InitGDIPlus;
+
+finalization
+  DoneGDIPlus;
+
+end.

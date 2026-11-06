@@ -1,0 +1,1092 @@
+﻿unit Unit1;
+
+interface
+
+uses
+  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants,
+  System.Classes, System.Generics.Collections, System.Generics.Defaults,
+  Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs,
+  Vcl.ExtCtrls, Vcl.StdCtrls,
+  Winapi.GDIPAPI, Winapi.GDIPOBJ;
+
+const
+  Cols = 9;
+  Rows = 10;
+
+  Empty   = 0;
+  KING    = 1;
+  ADVISOR = 2;
+  ELEPHANT= 3;
+  HORSE   = 4;
+  ROOK    = 5;
+  CANNON  = 6;
+  PAWN    = 7;
+  Red     = 0;
+  Black   = 8;
+  Wall    = $FF;
+
+  INF = 1000000;
+
+type
+  TBoardArray = array[0..Rows - 1, 0..Cols - 1] of Byte;
+
+  TMove = record
+    FromC, FromR, ToC, ToR: ShortInt;
+    Captured: Byte;
+  end;
+
+  TGameState = record
+    Board: TBoardArray;
+    SideToMove: Byte;
+    GameOver: Boolean;
+  end;
+
+  TForm1 = class(TForm)
+    PaintBoard: TPaintBox;
+    PanelBottom: TPanel;
+    lblStatus: TLabel;
+    btnNewGame: TButton;
+    btnUndo: TButton;
+    chkAI: TCheckBox;
+    AITimer: TTimer;
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+    procedure FormResize(Sender: TObject);
+    procedure PaintBoardPaint(Sender: TObject);
+    procedure PaintBoardMouseUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Integer);
+    procedure btnNewGameClick(Sender: TObject);
+    procedure btnUndoClick(Sender: TObject);
+    procedure chkAIClick(Sender: TObject);
+    procedure AITimerTimer(Sender: TObject);
+  private
+    FBoard: TBoardArray;
+    FSideToMove: Byte;
+    FGameOver: Boolean;
+    FAIMode: Boolean;
+    FHistory: TList<TGameState>;
+
+    FSelectedC, FSelectedR: Integer;
+    FLegalTargets: array[0..Rows - 1, 0..Cols - 1] of Boolean;
+
+    FCellW, FCellH: Integer;
+
+    procedure InitBoard;
+    procedure UpdateStatus;
+    procedure UpdateCellSize;
+    procedure ClearSelection;
+
+    function  SameSide(P, Side: Byte): Boolean;
+    function  GetState: TGameState;
+    procedure RestoreState(const S: TGameState);
+
+    procedure GenMoves(const B: TGameState; Side: Byte; List: TList<TMove>);
+    procedure GenPieceMoves(const B: TGameState; C, R: Integer; List: TList<TMove>);
+    function  IsLegalMove(const B: TGameState;
+      FromC, FromR, ToC, ToR: Integer): Boolean;
+    function  KingsFacing(const B: TGameState): Boolean;
+    function  InCheck(const B: TGameState; Side: Byte): Boolean;
+    function  HasAnyLegalMove(const B: TGameState; Side: Byte): Boolean;
+    procedure MakeMove(var B: TGameState; const M: TMove);
+
+    function  Evaluate(const B: TGameState): Integer;
+    function  AlphaBeta(var B: TGameState; Depth, Alpha, Beta: Integer): Integer;
+    function  SearchBestMove(var B: TGameState; Depth: Integer;
+      out Best: TMove): Boolean;
+
+    procedure AIMove;
+    function  IsHumanTurn: Boolean;
+    function  IsAITurn: Boolean;
+    function  PieceName(P: Byte): string;
+  end;
+
+var
+  Form1: TForm1;
+
+implementation
+
+{$R *.dfm}
+
+var
+  GdiplusToken: ULONG_PTR = 0;
+
+procedure InitGDIPlus;
+var
+  SI: TGdiplusStartupInput;
+begin
+  SI.GdiplusVersion := 1;
+  SI.DebugEventCallback := nil;
+  SI.SuppressBackgroundThread := False;
+  SI.SuppressExternalCodecs := False;
+  GdiplusStartup(GdiplusToken, @SI, nil);
+end;
+
+procedure DoneGDIPlus;
+begin
+  if GdiplusToken <> 0 then
+    GdiplusShutdown(GdiplusToken);
+end;
+
+const
+  PieceValue: array[0..7] of Integer = (
+    0, 10000, 200, 200, 450, 900, 500, 100
+  );
+
+function MinInt(A, B: Integer): Integer;
+begin
+  if A < B then Result := A else Result := B;
+end;
+
+{ ---------- 基本工具 ---------- }
+
+function TForm1.SameSide(P, Side: Byte): Boolean;
+begin
+  if (P = Empty) or (P = Wall) then
+    Result := False
+  else if Side = Red then
+    Result := (P and 8) = 0
+  else
+    Result := (P and 8) <> 0;
+end;
+
+function TForm1.GetState: TGameState;
+begin
+  Result.Board := FBoard;
+  Result.SideToMove := FSideToMove;
+  Result.GameOver := FGameOver;
+end;
+
+procedure TForm1.RestoreState(const S: TGameState);
+begin
+  FBoard := S.Board;
+  FSideToMove := S.SideToMove;
+  FGameOver := S.GameOver;
+end;
+
+function TForm1.PieceName(P: Byte): string;
+begin
+  case P and 7 of
+    KING:     if (P and 8) = 0 then Result := '帅' else Result := '将';
+    ADVISOR:  if (P and 8) = 0 then Result := '仕' else Result := '士';
+    ELEPHANT: if (P and 8) = 0 then Result := '相' else Result := '象';
+    HORSE:    Result := '马';
+    ROOK:     Result := '车';
+    CANNON:   Result := '炮';
+    PAWN:     if (P and 8) = 0 then Result := '兵' else Result := '卒';
+  else
+    Result := '';
+  end;
+end;
+
+{ ---------- 窗体生命周期 ---------- }
+
+procedure TForm1.FormCreate(Sender: TObject);
+begin
+  DoubleBuffered := True;
+  FHistory := TList<TGameState>.Create;
+
+  FCellW := 60;
+  FCellH := 60;
+
+  UpdateCellSize;
+  FAIMode := False;
+  InitBoard;
+end;
+
+procedure TForm1.FormDestroy(Sender: TObject);
+begin
+  FHistory.Free;
+end;
+
+procedure TForm1.FormResize(Sender: TObject);
+begin
+  UpdateCellSize;
+  PaintBoard.Invalidate;
+end;
+
+procedure TForm1.UpdateCellSize;
+begin
+  if (PaintBoard.ClientWidth <= 0) or (PaintBoard.ClientHeight <= 0) then Exit;
+  FCellW := PaintBoard.ClientWidth div Cols;
+  FCellH := PaintBoard.ClientHeight div Rows;
+  if FCellW < 10 then FCellW := 10;
+  if FCellH < 10 then FCellH := 10;
+end;
+
+procedure TForm1.InitBoard;
+const
+  Initial: array[0..Rows - 1] of array[0..Cols - 1] of Byte = (
+    (Black or ROOK,  Black or HORSE, Black or ELEPHANT, Black or ADVISOR, Black or KING, Black or ADVISOR, Black or ELEPHANT, Black or HORSE, Black or ROOK),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Empty, Black or CANNON, Empty, Empty, Empty, Empty, Empty, Black or CANNON, Empty),
+    (Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN, Empty, Black or PAWN),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN, Empty, Red or PAWN),
+    (Empty, Red or CANNON, Empty, Empty, Empty, Empty, Empty, Red or CANNON, Empty),
+    (Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty),
+    (Red or ROOK, Red or HORSE, Red or ELEPHANT, Red or ADVISOR, Red or KING, Red or ADVISOR, Red or ELEPHANT, Red or HORSE, Red or ROOK)
+  );
+var
+  R, C: Integer;
+begin
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      FBoard[R, C] := Initial[R, C];
+
+  FSideToMove := Red;
+  FGameOver := False;
+  FHistory.Clear;
+  ClearSelection;
+  AITimer.Enabled := False;
+  UpdateStatus;
+  PaintBoard.Invalidate;
+end;
+
+procedure TForm1.UpdateStatus;
+begin
+  if FGameOver then
+    lblStatus.Caption := '游戏结束'
+  else if FSideToMove = Red then
+    lblStatus.Caption := '红方走棋'
+  else
+    lblStatus.Caption := '黑方走棋';
+end;
+
+procedure TForm1.ClearSelection;
+var
+  C, R: Integer;
+begin
+  FSelectedC := -1;
+  FSelectedR := -1;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      FLegalTargets[R, C] := False;
+end;
+
+{ ---------- 绘制 ---------- }
+
+procedure TForm1.PaintBoardPaint(Sender: TObject);
+var
+  G: TGPGraphics;
+  Bg: TGPSolidBrush;
+  PenLine, PenBorder, PenHighlight: TGPPen;
+  PieceBrush: TGPLinearGradientBrush;
+  TextBrush: TGPSolidBrush;
+  Font: TGPFont;
+  StringFormat: TGPStringFormat;
+  CellW, CellH, CX, CY, Radius, C, R: Integer;
+  Left1, Right1, Top1, Bottom1: Integer;
+  P: Byte;
+  S: string;
+  RectF: TGPRectF;
+begin
+  CellW := FCellW;
+  CellH := FCellH;
+  if (CellW < 4) or (CellH < 4) then Exit;
+
+  // 交叉点位于每个格子的中心：x = (C + 0.5) * CellW, y = (R + 0.5) * CellH
+  Left1   := Round(0.5 * CellW);
+  Right1  := Round((Cols - 0.5) * CellW);
+  Top1    := Round(0.5 * CellH);
+  Bottom1 := Round((Rows - 0.5) * CellH);
+
+  G := TGPGraphics.Create(PaintBoard.Canvas.Handle);
+  try
+    G.SetSmoothingMode(SmoothingModeAntiAlias);
+    G.SetTextRenderingHint(TextRenderingHintAntiAlias);
+
+    // 1. 背景木色铺满
+    Bg := TGPSolidBrush.Create(MakeColor(255, 242, 214, 168));
+    try
+      G.FillRectangle(Bg,
+        MakeRect(0, 0, PaintBoard.ClientWidth + 1, PaintBoard.ClientHeight + 1));
+    finally
+      Bg.Free;
+    end;
+
+    // 2. 棋盘线
+    PenLine := TGPPen.Create(MakeColor(200, 120, 80, 40), 1);
+    try
+      // 10 条横线
+      for R := 0 to Rows - 1 do
+      begin
+        CY := Round((R + 0.5) * CellH);
+        G.DrawLine(PenLine, Left1, CY, Right1, CY);
+      end;
+
+      // 9 条竖线（楚河汉界处断开；两侧贯通）
+      for C := 0 to Cols - 1 do
+      begin
+        CX := Round((C + 0.5) * CellW);
+        if (C = 0) or (C = Cols - 1) then
+          G.DrawLine(PenLine, CX, Top1, CX, Bottom1)
+        else
+        begin
+          G.DrawLine(PenLine, CX, Top1, CX, Round(4.5 * CellH));
+          G.DrawLine(PenLine, CX, Round(5.5 * CellH), CX, Bottom1);
+        end;
+      end;
+
+      // 上九宫（黑方）：斜线 (3,0)-(5,2) 与 (5,0)-(3,2)
+      G.DrawLine(PenLine,
+        Round(3.5 * CellW), Round(0.5 * CellH),
+        Round(5.5 * CellW), Round(2.5 * CellH));
+      G.DrawLine(PenLine,
+        Round(5.5 * CellW), Round(0.5 * CellH),
+        Round(3.5 * CellW), Round(2.5 * CellH));
+
+      // 下九宫（红方）：斜线 (3,7)-(5,9) 与 (5,7)-(3,9)
+      G.DrawLine(PenLine,
+        Round(3.5 * CellW), Round(7.5 * CellH),
+        Round(5.5 * CellW), Round(9.5 * CellH));
+      G.DrawLine(PenLine,
+        Round(5.5 * CellW), Round(7.5 * CellH),
+        Round(3.5 * CellW), Round(9.5 * CellH));
+    finally
+      PenLine.Free;
+    end;
+
+    // 3. 外框粗线
+    PenBorder := TGPPen.Create(MakeColor(255, 80, 40, 10), 2);
+    try
+      G.DrawRectangle(PenBorder,
+        Left1, Top1,
+        Round(8 * CellW), Round(9 * CellH));
+    finally
+      PenBorder.Free;
+    end;
+
+    // 4. 选中高亮
+    if (FSelectedC >= 0) and (FSelectedR >= 0) then
+    begin
+      CX := Round((FSelectedC + 0.5) * CellW);
+      CY := Round((FSelectedR + 0.5) * CellH);
+      Radius := MinInt(CellW, CellH) div 2 - 2;
+      if Radius < 10 then Radius := 10;
+      PenHighlight := TGPPen.Create(MakeColor(255, 0, 120, 215), 3);
+      try
+        G.DrawEllipse(PenHighlight,
+          CX - Radius, CY - Radius, Radius * 2, Radius * 2);
+      finally
+        PenHighlight.Free;
+      end;
+    end;
+
+    // 5. 合法目标点
+    for R := 0 to Rows - 1 do
+      for C := 0 to Cols - 1 do
+        if FLegalTargets[R, C] then
+        begin
+          CX := Round((C + 0.5) * CellW);
+          CY := Round((R + 0.5) * CellH);
+          Bg := TGPSolidBrush.Create(MakeColor(160, 0, 160, 0));
+          try
+            G.FillEllipse(Bg, CX - 5, CY - 5, 10, 10);
+          finally
+            Bg.Free;
+          end;
+        end;
+
+    // 6. 棋子
+    Radius := MinInt(CellW, CellH) div 2 - 4;
+    if Radius < 8 then Radius := 8;
+
+    for R := 0 to Rows - 1 do
+      for C := 0 to Cols - 1 do
+      begin
+        P := FBoard[R, C];
+        if (P = Empty) or (P = Wall) then Continue;
+
+        CX := Round((C + 0.5) * CellW);
+        CY := Round((R + 0.5) * CellH);
+
+        if (P and 8) = 0 then
+        begin
+          PieceBrush := TGPLinearGradientBrush.Create(
+            MakeRect(CX - Radius, CY - Radius, Radius * 2, Radius * 2),
+            MakeColor(255, 255, 240, 210),
+            MakeColor(255, 235, 200, 150),
+            LinearGradientModeForwardDiagonal);
+          PenBorder := TGPPen.Create(MakeColor(255, 180, 60, 20), 2);
+          TextBrush := TGPSolidBrush.Create(MakeColor(255, 200, 20, 20));
+        end
+        else
+        begin
+          PieceBrush := TGPLinearGradientBrush.Create(
+            MakeRect(CX - Radius, CY - Radius, Radius * 2, Radius * 2),
+            MakeColor(255, 240, 240, 240),
+            MakeColor(255, 200, 200, 200),
+            LinearGradientModeForwardDiagonal);
+          PenBorder := TGPPen.Create(MakeColor(255, 60, 60, 60), 2);
+          TextBrush := TGPSolidBrush.Create(MakeColor(255, 20, 20, 20));
+        end;
+
+        try
+          G.FillEllipse(PieceBrush, CX - Radius, CY - Radius, Radius * 2, Radius * 2);
+          G.DrawEllipse(PenBorder, CX - Radius, CY - Radius, Radius * 2, Radius * 2);
+        finally
+          PieceBrush.Free;
+          PenBorder.Free;
+        end;
+
+        S := PieceName(P);
+        Font := TGPFont.Create('Microsoft YaHei', Radius * 1.1, FontStyleBold, UnitPixel);
+        StringFormat := TGPStringFormat.Create;
+        try
+          StringFormat.SetAlignment(StringAlignmentCenter);
+          StringFormat.SetLineAlignment(StringAlignmentCenter);
+          RectF.X := CX - Radius;
+          RectF.Y := CY - Radius;
+          RectF.Width := Radius * 2;
+          RectF.Height := Radius * 2;
+          G.DrawString(S, Length(S), Font, RectF, StringFormat, TextBrush);
+        finally
+          StringFormat.Free;
+          Font.Free;
+          TextBrush.Free;
+        end;
+      end;
+  finally
+    G.Free;
+  end;
+end;
+
+{ ---------- 鼠标交互 ---------- }
+
+procedure TForm1.PaintBoardMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Integer);
+var
+  Col, Row: Integer;
+  P: Byte;
+  Moves: TList<TMove>;
+  M: TMove;
+  B: TGameState;
+begin
+  if FGameOver then Exit;
+  if Button <> mbLeft then Exit;
+  if not IsHumanTurn then Exit;
+  if (FCellW <= 0) or (FCellH <= 0) then Exit;
+
+  // 自行映射鼠标坐标到行列
+  Col := X div FCellW;
+  Row := Y div FCellH;
+  if (Col < 0) or (Col >= Cols) or (Row < 0) or (Row >= Rows) then Exit;
+
+  P := FBoard[Row, Col];
+
+  // 已选中棋子且点击合法目标 → 尝试走子
+  if (FSelectedC >= 0) and FLegalTargets[Row, Col] then
+  begin
+    B := GetState;
+    if not IsLegalMove(B, FSelectedC, FSelectedR, Col, Row) then
+    begin
+      ClearSelection;
+      PaintBoard.Invalidate;
+      Exit;
+    end;
+
+    FHistory.Add(B);
+    FBoard[Row, Col] := FBoard[FSelectedR, FSelectedC];
+    FBoard[FSelectedR, FSelectedC] := Empty;
+    ClearSelection;
+
+    if FSideToMove = Red then FSideToMove := Black
+    else FSideToMove := Red;
+    UpdateStatus;
+    PaintBoard.Invalidate;
+
+    if not HasAnyLegalMove(GetState, FSideToMove) then
+    begin
+      FGameOver := True;
+      UpdateStatus;
+      if FSideToMove = Red then
+        ShowMessage('黑方获胜！')
+      else
+        ShowMessage('红方获胜！');
+      Exit;
+    end;
+
+    if IsAITurn then
+      AITimer.Enabled := True;
+    Exit;
+  end;
+
+  // 选择新棋子
+  ClearSelection;
+  if SameSide(P, FSideToMove) then
+  begin
+    FSelectedC := Col;
+    FSelectedR := Row;
+    B := GetState;
+    Moves := TList<TMove>.Create;
+    try
+      GenPieceMoves(B, Col, Row, Moves);
+      for M in Moves do
+        FLegalTargets[M.ToR, M.ToC] := True;
+    finally
+      Moves.Free;
+    end;
+  end;
+  PaintBoard.Invalidate;
+end;
+
+{ ---------- 走法生成 ---------- }
+
+procedure TForm1.GenMoves(const B: TGameState; Side: Byte; List: TList<TMove>);
+var
+  C, R: Integer;
+begin
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      if SameSide(B.Board[R, C], Side) then
+        GenPieceMoves(B, C, R, List);
+end;
+
+procedure TForm1.GenPieceMoves(const B: TGameState; C, R: Integer;
+  List: TList<TMove>);
+var
+  P, T: Byte;
+  M: TMove;
+
+  procedure Add(TC, TR: Integer);
+  begin
+    if (TC < 0) or (TC >= Cols) or (TR < 0) or (TR >= Rows) then Exit;
+    T := B.Board[TR, TC];
+    if SameSide(T, P) then Exit;
+    M.FromC := C; M.FromR := R; M.ToC := TC; M.ToR := TR;
+    M.Captured := T;
+    List.Add(M);
+  end;
+
+  procedure AddLine(DC, DR: Integer);
+  var
+    CC, RR: Integer;
+  begin
+    CC := C + DC; RR := R + DR;
+    while (CC >= 0) and (CC < Cols) and (RR >= 0) and (RR < Rows) do
+    begin
+      T := B.Board[RR, CC];
+      if T = Empty then
+      begin
+        Add(CC, RR);
+        Inc(CC, DC); Inc(RR, DR);
+      end
+      else
+      begin
+        if not SameSide(T, P) then Add(CC, RR);
+        Break;
+      end;
+    end;
+  end;
+
+  procedure AddCannon(DC, DR: Integer);
+  var
+    CC, RR: Integer;
+    Screened: Boolean;
+  begin
+    CC := C + DC; RR := R + DR;
+    Screened := False;
+    while (CC >= 0) and (CC < Cols) and (RR >= 0) and (RR < Rows) do
+    begin
+      T := B.Board[RR, CC];
+      if not Screened then
+      begin
+        if T = Empty then
+          Add(CC, RR)
+        else
+          Screened := True;
+      end
+      else
+      begin
+        if T <> Empty then
+        begin
+          if not SameSide(T, P) then Add(CC, RR);
+          Break;
+        end;
+      end;
+      Inc(CC, DC); Inc(RR, DR);
+    end;
+  end;
+
+begin
+  P := B.Board[R, C];
+  case P and 7 of
+    KING:
+      if (P and 8) = 0 then
+      begin
+        if R > 7 then Add(C, R - 1);
+        if R < 9 then Add(C, R + 1);
+        if C > 3 then Add(C - 1, R);
+        if C < 5 then Add(C + 1, R);
+      end
+      else
+      begin
+        if R > 0 then Add(C, R - 1);
+        if R < 2 then Add(C, R + 1);
+        if C > 3 then Add(C - 1, R);
+        if C < 5 then Add(C + 1, R);
+      end;
+
+    ADVISOR:
+      if (P and 8) = 0 then
+      begin
+        if (C = 3) and (R = 9) then Add(4, 8);
+        if (C = 5) and (R = 9) then Add(4, 8);
+        if (C = 4) and (R = 8) then begin Add(3, 9); Add(5, 9); Add(3, 7); Add(5, 7); end;
+        if (C = 3) and (R = 7) then Add(4, 8);
+        if (C = 5) and (R = 7) then Add(4, 8);
+      end
+      else
+      begin
+        if (C = 3) and (R = 0) then Add(4, 1);
+        if (C = 5) and (R = 0) then Add(4, 1);
+        if (C = 4) and (R = 1) then begin Add(3, 0); Add(5, 0); Add(3, 2); Add(5, 2); end;
+        if (C = 3) and (R = 2) then Add(4, 1);
+        if (C = 5) and (R = 2) then Add(4, 1);
+      end;
+
+    ELEPHANT:
+      if (P and 8) = 0 then
+      begin
+        if (C >= 2) and (R >= 2) and (B.Board[R - 1, C - 1] = Empty) then Add(C - 2, R - 2);
+        if (C <= 6) and (R >= 2) and (B.Board[R - 1, C + 1] = Empty) then Add(C + 2, R - 2);
+        if (C >= 2) and (R <= 7) and (B.Board[R + 1, C - 1] = Empty) then Add(C - 2, R + 2);
+        if (C <= 6) and (R <= 7) and (B.Board[R + 1, C + 1] = Empty) then Add(C + 2, R + 2);
+      end
+      else
+      begin
+        if (C >= 2) and (R >= 2) and (B.Board[R - 1, C - 1] = Empty) then Add(C - 2, R - 2);
+        if (C <= 6) and (R >= 2) and (B.Board[R - 1, C + 1] = Empty) then Add(C + 2, R - 2);
+        if (C >= 2) and (R <= 7) and (B.Board[R + 1, C - 1] = Empty) then Add(C - 2, R + 2);
+        if (C <= 6) and (R <= 7) and (B.Board[R + 1, C + 1] = Empty) then Add(C + 2, R + 2);
+      end;
+
+    HORSE:
+      begin
+        if (R - 2 >= 0) and (B.Board[R - 1, C] = Empty) then
+        begin
+          if C - 1 >= 0 then Add(C - 1, R - 2);
+          if C + 1 < Cols then Add(C + 1, R - 2);
+        end;
+        if (R + 2 < Rows) and (B.Board[R + 1, C] = Empty) then
+        begin
+          if C - 1 >= 0 then Add(C - 1, R + 2);
+          if C + 1 < Cols then Add(C + 1, R + 2);
+        end;
+        if (C - 2 >= 0) and (B.Board[R, C - 1] = Empty) then
+        begin
+          if R - 1 >= 0 then Add(C - 2, R - 1);
+          if R + 1 < Rows then Add(C - 2, R + 1);
+        end;
+        if (C + 2 < Cols) and (B.Board[R, C + 1] = Empty) then
+        begin
+          if R - 1 >= 0 then Add(C + 2, R - 1);
+          if R + 1 < Rows then Add(C + 2, R + 1);
+        end;
+      end;
+
+    ROOK:
+      begin
+        AddLine(1, 0); AddLine(-1, 0);
+        AddLine(0, 1); AddLine(0, -1);
+      end;
+
+    CANNON:
+      begin
+        AddCannon(1, 0); AddCannon(-1, 0);
+        AddCannon(0, 1); AddCannon(0, -1);
+      end;
+
+    PAWN:
+      if (P and 8) = 0 then
+      begin
+        Add(C, R - 1);
+        if R <= 4 then
+        begin
+          if C > 0 then Add(C - 1, R);
+          if C < Cols - 1 then Add(C + 1, R);
+        end;
+      end
+      else
+      begin
+        Add(C, R + 1);
+        if R >= 5 then
+        begin
+          if C > 0 then Add(C - 1, R);
+          if C < Cols - 1 then Add(C + 1, R);
+        end;
+      end;
+  end;
+end;
+
+{ ---------- 规则判定 ---------- }
+
+function TForm1.KingsFacing(const B: TGameState): Boolean;
+var
+  C, R: Integer;
+  RedCol, RedRow, BlackCol, BlackRow: Integer;
+  TopR, BotR: Integer;
+begin
+  Result := False;
+  RedCol := -1; RedRow := -1;
+  BlackCol := -1; BlackRow := -1;
+
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+    begin
+      if B.Board[R, C] = (Red or KING) then
+      begin
+        RedCol := C; RedRow := R;
+      end
+      else if B.Board[R, C] = (Black or KING) then
+      begin
+        BlackCol := C; BlackRow := R;
+      end;
+    end;
+
+  if (RedCol < 0) or (BlackCol < 0) then Exit;
+  if RedCol <> BlackCol then Exit;
+
+  if RedRow < BlackRow then
+  begin
+    TopR := RedRow; BotR := BlackRow;
+  end
+  else
+  begin
+    TopR := BlackRow; BotR := RedRow;
+  end;
+
+  for R := TopR + 1 to BotR - 1 do
+    if B.Board[R, RedCol] <> Empty then Exit;
+
+  Result := True;
+end;
+
+function TForm1.InCheck(const B: TGameState; Side: Byte): Boolean;
+var
+  C, R, KingC, KingR: Integer;
+  Opp: Byte;
+  Moves: TList<TMove>;
+  M: TMove;
+begin
+  Result := False;
+
+  if KingsFacing(B) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  Opp := Black;
+  if Side = Black then Opp := Red;
+
+  KingC := -1; KingR := -1;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      if SameSide(B.Board[R, C], Side) and ((B.Board[R, C] and 7) = KING) then
+      begin
+        KingC := C; KingR := R;
+        Break;
+      end;
+  if KingC < 0 then Exit;
+
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, Opp, Moves);
+    for M in Moves do
+      if (M.ToC = KingC) and (M.ToR = KingR) then
+      begin
+        Result := True;
+        Exit;
+      end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.HasAnyLegalMove(const B: TGameState; Side: Byte): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Temp: TGameState;
+begin
+  Result := False;
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, Side, Moves);
+    for M in Moves do
+    begin
+      Temp := B;
+      MakeMove(Temp, M);
+      if not InCheck(Temp, Side) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.IsLegalMove(const B: TGameState;
+  FromC, FromR, ToC, ToR: Integer): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Temp: TGameState;
+begin
+  Result := False;
+  Moves := TList<TMove>.Create;
+  try
+    GenPieceMoves(B, FromC, FromR, Moves);
+    for M in Moves do
+      if (M.ToC = ToC) and (M.ToR = ToR) then
+      begin
+        Temp := B;
+        MakeMove(Temp, M);
+        Result := not InCheck(Temp, B.SideToMove);
+        Exit;
+      end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+procedure TForm1.MakeMove(var B: TGameState; const M: TMove);
+begin
+  B.Board[M.ToR, M.ToC] := B.Board[M.FromR, M.FromC];
+  B.Board[M.FromR, M.FromC] := Empty;
+  if B.SideToMove = Red then B.SideToMove := Black
+  else B.SideToMove := Red;
+end;
+
+{ ---------- AI ---------- }
+
+function TForm1.Evaluate(const B: TGameState): Integer;
+var
+  R, C: Integer;
+  P: Byte;
+  V: Integer;
+begin
+  Result := 0;
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+    begin
+      P := B.Board[R, C];
+      if P = Empty then Continue;
+      V := PieceValue[P and 7];
+      if (P and 7) = PAWN then
+      begin
+        if ((P and 8) = 0) and (R <= 4) then Inc(V, 80);
+        if ((P and 8) <> 0) and (R >= 5) then Inc(V, 80);
+      end;
+      if (P and 8) = 0 then Inc(Result, V)
+      else Dec(Result, V);
+    end;
+
+  if B.SideToMove = Black then
+    Result := -Result;
+end;
+
+function TForm1.AlphaBeta(var B: TGameState;
+  Depth, Alpha, Beta: Integer): Integer;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Score: Integer;
+  Maxing: Boolean;
+  HasMove: Boolean;
+  Temp: TGameState;
+begin
+  if Depth = 0 then
+    Exit(Evaluate(B));
+
+  Maxing := B.SideToMove = Red;
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, B.SideToMove, Moves);
+    Moves.Sort(TComparer<TMove>.Construct(
+      function(const L, R: TMove): Integer
+      begin
+        Result := PieceValue[R.Captured and 7] - PieceValue[L.Captured and 7];
+      end));
+
+    HasMove := False;
+    if Maxing then
+    begin
+      Result := -INF;
+      for M in Moves do
+      begin
+        Temp := B;
+        MakeMove(Temp, M);
+        if InCheck(Temp, Black) then Continue;
+        HasMove := True;
+        Score := AlphaBeta(Temp, Depth - 1, Alpha, Beta);
+        if Score > Result then Result := Score;
+        if Result > Alpha then Alpha := Result;
+        if Alpha >= Beta then Break;
+      end;
+      if not HasMove then
+        Result := -INF + Depth;
+    end
+    else
+    begin
+      Result := INF;
+      for M in Moves do
+      begin
+        Temp := B;
+        MakeMove(Temp, M);
+        if InCheck(Temp, Red) then Continue;
+        HasMove := True;
+        Score := AlphaBeta(Temp, Depth - 1, Alpha, Beta);
+        if Score < Result then Result := Score;
+        if Result < Beta then Beta := Result;
+        if Beta <= Alpha then Break;
+      end;
+      if not HasMove then
+        Result := INF - Depth;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+function TForm1.SearchBestMove(var B: TGameState; Depth: Integer;
+  out Best: TMove): Boolean;
+var
+  Moves: TList<TMove>;
+  M: TMove;
+  Score, BestScore: Integer;
+  Temp: TGameState;
+  Mover: Byte;
+begin
+  Result := False;
+  BestScore := -INF;
+  Mover := B.SideToMove;
+
+  Moves := TList<TMove>.Create;
+  try
+    GenMoves(B, Mover, Moves);
+    Moves.Sort(TComparer<TMove>.Construct(
+      function(const L, R: TMove): Integer
+      begin
+        Result := PieceValue[R.Captured and 7] - PieceValue[L.Captured and 7];
+      end));
+
+    for M in Moves do
+    begin
+      Temp := B;
+      MakeMove(Temp, M);
+      if InCheck(Temp, Mover) then Continue;
+      Score := AlphaBeta(Temp, Depth - 1, -INF, INF);
+      if Score > BestScore then
+      begin
+        BestScore := Score;
+        Best := M;
+        Result := True;
+      end;
+    end;
+  finally
+    Moves.Free;
+  end;
+end;
+
+procedure TForm1.AIMove;
+var
+  B: TGameState;
+  Best: TMove;
+  Mover: Byte;
+begin
+  B := GetState;
+  Mover := B.SideToMove;
+
+  if not SearchBestMove(B, 3, Best) then
+  begin
+    FGameOver := True;
+    UpdateStatus;
+    if Mover = Red then
+      ShowMessage('黑方获胜！')
+    else
+      ShowMessage('红方获胜！');
+    Exit;
+  end;
+
+  FHistory.Add(B);
+  FBoard[Best.ToR, Best.ToC] := FBoard[Best.FromR, Best.FromC];
+  FBoard[Best.FromR, Best.FromC] := Empty;
+
+  if FSideToMove = Red then FSideToMove := Black
+  else FSideToMove := Red;
+  ClearSelection;
+  UpdateStatus;
+  PaintBoard.Invalidate;
+
+  if not HasAnyLegalMove(GetState, FSideToMove) then
+  begin
+    FGameOver := True;
+    UpdateStatus;
+    if FSideToMove = Red then
+      ShowMessage('黑方获胜！')
+    else
+      ShowMessage('红方获胜！');
+  end;
+end;
+
+function TForm1.IsHumanTurn: Boolean;
+begin
+  Result := (not FAIMode) or (FSideToMove = Red);
+end;
+
+function TForm1.IsAITurn: Boolean;
+begin
+  Result := FAIMode and (FSideToMove = Black);
+end;
+
+procedure TForm1.AITimerTimer(Sender: TObject);
+begin
+  AITimer.Enabled := False;
+  if (not FGameOver) and IsAITurn then
+    AIMove;
+end;
+
+{ ---------- 按钮 ---------- }
+
+procedure TForm1.btnNewGameClick(Sender: TObject);
+begin
+  if MessageDlg('确定开始新局？', mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
+    Exit;
+  InitBoard;
+end;
+
+procedure TForm1.btnUndoClick(Sender: TObject);
+var
+  St: TGameState;
+begin
+  AITimer.Enabled := False;
+  if FHistory.Count = 0 then Exit;
+
+  St := FHistory.Last;
+  FHistory.Delete(FHistory.Count - 1);
+  RestoreState(St);
+  FGameOver := False;
+  ClearSelection;
+  UpdateStatus;
+  PaintBoard.Invalidate;
+end;
+
+procedure TForm1.chkAIClick(Sender: TObject);
+begin
+  FAIMode := chkAI.Checked;
+  if FAIMode and (not FGameOver) and IsAITurn then
+    AITimer.Enabled := True;
+end;
+
+initialization
+  InitGDIPlus;
+
+finalization
+  DoneGDIPlus;
+
+end.
